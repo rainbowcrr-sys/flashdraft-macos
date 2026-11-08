@@ -5,11 +5,18 @@ on:
     branches: [ main ]
     tags: [ 'v0.*' ]
   pull_request:
+  schedule:
+    - cron: '23 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
     runs-on: macos-latest
     strategy:
+      fail-fast: false
       matrix:
         rid: [osx-arm64, osx-x64]
     steps:
@@ -19,16 +26,73 @@ jobs:
           dotnet-version: '10.0.x'
       - name: Build
         run: dotnet build FlashDraft.macOS.sln -c Release
-      - name: Publish
+      - name: Publish self-contained payload
         run: dotnet publish src/FlashDraft.Desktop/FlashDraft.Desktop.csproj -c Release -r ${{ matrix.rid }} --self-contained true -o ./publish
-      # The dmg is built in CI. It stays unsigned and is not notarized.
-      - name: Build unsigned dmg
-        run: hdiutil create -volname FlashDraft -srcfolder ./publish -ov -format UDZO FlashDraft-macOS-${{ matrix.rid }}.dmg
+      - name: Assemble .app bundle with icon
+        run: |
+          set -e
+          mkdir -p ./FlashDraft.app/Contents/MacOS ./FlashDraft.app/Contents/Resources
+          cp -a ./publish/. ./FlashDraft.app/Contents/MacOS/
+          cp assets/flashdraft.icns ./FlashDraft.app/Contents/Resources/
+          cp packaging/Info.plist ./FlashDraft.app/Contents/Info.plist
+          chmod +x ./FlashDraft.app/Contents/MacOS/FlashDraft.Desktop || true
+      - name: Build installable unsigned dmg
+        run: hdiutil create -volname FlashDraft -srcfolder ./FlashDraft.app -ov -format UDZO FlashDraft-macOS-${{ matrix.rid }}.dmg
       - name: Checksum
-        run: shasum -a 256 FlashDraft-macOS-${{ matrix.rid }}.dmg > SHA256SUMS.txt
+        run: shasum -a 256 FlashDraft-macOS-${{ matrix.rid }}.dmg > SHA256SUMS-${{ matrix.rid }}.txt
       - uses: actions/upload-artifact@v4
         with:
           name: flashdraft-macos-${{ matrix.rid }}
+          if-no-files-found: error
           path: |
             ./FlashDraft-macOS-${{ matrix.rid }}.dmg
-            ./SHA256SUMS.txt
+            ./SHA256SUMS-${{ matrix.rid }}.txt
+  release:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: flashdraft-*
+          path: dist
+          merge-multiple: true
+      - name: Publish build artifacts to a GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t FILES < <(find dist -type f -print)
+          if [ "${#FILES[@]}" -eq 0 ]; then
+            echo "::error::No build artifacts were downloaded"
+            exit 1
+          fi
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            TAG="${GITHUB_REF_NAME}"
+            TITLE="FlashDraft ${TAG}"
+            NOTES="Stable release ${TAG}. All packages are unsigned; verify SHA256SUMS before use."
+            PRERELEASE=0
+          elif [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
+            TAG="nightly"
+            TITLE="Nightly build $(date -u +%F)"
+            NOTES="Automated nightly build. Unsigned and unverified; use at your own risk."
+            PRERELEASE=1
+          else
+            TAG="edge"
+            TITLE="Edge build"
+            NOTES="Rolling build from the main branch. Unsigned and unverified."
+            PRERELEASE=1
+          fi
+          ARGS=()
+          if [[ "$PRERELEASE" == "1" ]]; then ARGS+=(--prerelease); fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # Remove stale assets so nightly/edge releases never accumulate old files.
+            gh release view "$TAG" --json assets --jq '.assets[].name' | while IFS= read -r name; do
+              gh release delete-asset "$TAG" "$name" --yes >/dev/null 2>&1 || true
+            done
+            gh release upload "$TAG" "${FILES[@]}" --clobber
+          else
+            gh release create "$TAG" "${ARGS[@]}" --title "$TITLE" --notes "$NOTES" "${FILES[@]}"
+          fi
+          echo "Published ${#FILES[@]} file(s) to release $TAG"
