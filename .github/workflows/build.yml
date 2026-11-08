@@ -1,0 +1,34 @@
+name: macos-build
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v0.*' ]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        rid: [osx-arm64, osx-x64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Build
+        run: dotnet build FlashDraft.macOS.sln -c Release
+      - name: Publish
+        run: dotnet publish src/FlashDraft.Desktop/FlashDraft.Desktop.csproj -c Release -r ${{ matrix.rid }} --self-contained true -o ./publish
+      # The dmg is built in CI. It stays unsigned and is not notarized.
+      - name: Build unsigned dmg
+        run: hdiutil create -volname FlashDraft -srcfolder ./publish -ov -format UDZO FlashDraft-macOS-${{ matrix.rid }}.dmg
+      - name: Checksum
+        run: shasum -a 256 FlashDraft-macOS-${{ matrix.rid }}.dmg > SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flashdraft-macos-${{ matrix.rid }}
+          path: |
+            ./FlashDraft-macOS-${{ matrix.rid }}.dmg
+            ./SHA256SUMS.txt
