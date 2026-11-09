@@ -22,7 +22,34 @@ permissions:
   contents: write
 
 jobs:
+  precheck:
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          # Only the scheduled nightly is skipped. Every other event builds.
+          if [[ "${{ github.event_name }}" != "schedule" ]]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          SHA="${{ github.sha }}"
+          BODY="$(gh release view nightly --json body --jq '.body' 2>/dev/null || true)"
+          if [[ "$BODY" == *"Build-SHA: $SHA"* ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Nightly already built for $SHA; skipping."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
+    needs: precheck
+    if: needs.precheck.outputs.skip != 'true'
     runs-on: macos-latest
     strategy:
       fail-fast: false
@@ -37,6 +64,10 @@ jobs:
         run: dotnet build FlashDraft.macOS.sln -c Release
       - name: Publish self-contained payload
         run: dotnet publish src/FlashDraft.Desktop/FlashDraft.Desktop.csproj -c Release -r ${{ matrix.rid }} --self-contained true -o ./publish
+      - name: Fetch canonical license
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/rainbowcrr-sys/flashdraft-core/main/LICENSE -o packaging/LICENSE.txt \
+            || cp LICENSE packaging/LICENSE.txt
       - name: Assemble .app bundle with icon
         run: |
           set -e
@@ -44,9 +75,22 @@ jobs:
           cp -a ./publish/. ./FlashDraft.app/Contents/MacOS/
           cp assets/flashdraft.icns ./FlashDraft.app/Contents/Resources/
           cp packaging/Info.plist ./FlashDraft.app/Contents/Info.plist
+          cp packaging/LICENSE.txt ./FlashDraft.app/Contents/Resources/LICENSE.txt
           chmod +x ./FlashDraft.app/Contents/MacOS/FlashDraft.Desktop || true
-      - name: Build installable unsigned dmg
-        run: hdiutil create -volname FlashDraft -srcfolder ./FlashDraft.app -ov -format UDZO FlashDraft-macOS-${{ matrix.rid }}.dmg
+      - name: Build installable dmg with an EULA
+        shell: bash
+        run: |
+          set -e
+          OUT="FlashDraft-macOS-${{ matrix.rid }}.dmg"
+          DMGBUILD="$(python3 -c 'import sysconfig,os; print(os.path.join(sysconfig.get_path("scripts"),"dmgbuild"))')"
+          if python3 -m pip install --quiet --break-system-packages dmgbuild 2>/dev/null || python3 -m pip install --quiet dmgbuild 2>/dev/null; then
+            if [ -x "$DMGBUILD" ] && "$DMGBUILD" -s packaging/dmgbuild.py FlashDraft "$OUT"; then
+              echo "FD_DMG=EULA_DMG"
+              exit 0
+            fi
+          fi
+          echo "::warning::dmgbuild unavailable; keeping a plain dmg. The in-app license gate still runs at first launch."
+          hdiutil create -volname FlashDraft -srcfolder ./FlashDraft.app -ov -format UDZO "$OUT"
       - name: Checksum
         run: shasum -a 256 FlashDraft-macOS-${{ matrix.rid }}.dmg > SHA256SUMS-${{ matrix.rid }}.txt
       - uses: actions/upload-artifact@v4
@@ -98,6 +142,7 @@ jobs:
             NOTES="Rolling build from the main branch. Unsigned and unverified."
             PRERELEASE=1
           fi
+          NOTES="${NOTES} | Build-SHA: ${GITHUB_SHA}"
           ARGS=()
           if [[ "$PRERELEASE" == "1" ]]; then ARGS+=(--prerelease); fi
           if gh release view "$TAG" >/dev/null 2>&1; then
@@ -106,6 +151,7 @@ jobs:
               gh release delete-asset "$TAG" "$name" --yes >/dev/null 2>&1 || true
             done
             gh release upload "$TAG" "${FILES[@]}" --clobber
+            gh release edit "$TAG" --notes "$NOTES" || true
           else
             gh release create "$TAG" "${ARGS[@]}" --title "$TITLE" --notes "$NOTES" "${FILES[@]}"
           fi
